@@ -322,6 +322,71 @@ def test_normalize_and_length_follow_native(test, device):
     test.assertTrue(np.all(np.isnan(sums.numpy()[:, 1])))
 
 
+# Float16 quaternions whose squared components leave the float16 range, seeded along the first component.
+JQH = wp.JetSpace((wp.quath,), width=1)
+J2H = wp.JetSpace2(1, dtype=wp.float16)
+
+
+@wp.kernel(enable_backward=False)
+def float16_quat_norms_kernel(
+    q: wp.array[wp.quath],
+    lengths: wp.array2d[wp.float16],
+    normalized: wp.array2d[wp.quath],
+    length_grads: wp.array2d[wp.float16],
+):
+    # Columns: native, first-order jet, second-order jet. Gradient columns: first order, second order.
+    i = wp.tid()
+    direction = wp.quath(wp.float16(1.0), wp.float16(0.0), wp.float16(0.0), wp.float16(0.0))
+    a = JQH.directional(q[i], direction)
+    b = J2H.make_quat(J2H.variable(q[i][0], 0), J2H.constant(q[i][1]), J2H.constant(q[i][2]), J2H.constant(q[i][3]))
+
+    lengths[i, 0] = wp.length(q[i])
+    length_a = wp.length(a)
+    length_b = wp.length(b)
+    lengths[i, 1] = length_a.value
+    lengths[i, 2] = length_b.value
+    length_grads[i, 0] = length_a.grad[0]
+    length_grads[i, 1] = length_b.grad[0]
+
+    normalized[i, 0] = wp.normalize(q[i])
+    normalized[i, 1] = wp.normalize(a).value
+    n = wp.normalize(b)
+    normalized[i, 2] = wp.quath(n.x.value, n.y.value, n.z.value, n.w.value)
+
+
+def test_float16_lengths_and_normalize_follow_native(test, device):
+    """Match native float16 quaternion lengths and unit quaternions where squaring a component leaves the range."""
+    q_np = np.array(
+        [
+            [300.0, 0.0, 0.0, 0.0],  # the square overflows float16
+            [0.0001, 0.0, 0.0, 0.0],  # the square underflows float16
+            [30000.0, 40000.0, 0.0, 0.0],  # the length fits, the squares do not
+            [60000.0, 0.0, 0.0, 60000.0],  # longer than the float16 maximum, the unit quaternion fits
+        ]
+    )
+    n = len(q_np)
+    q = wp.array(q_np, dtype=wp.quath, device=device)
+    lengths = wp.zeros((n, 3), dtype=wp.float16, device=device)
+    normalized = wp.zeros((n, 3), dtype=wp.quath, device=device)
+    length_grads = wp.zeros((n, 2), dtype=wp.float16, device=device)
+    wp.launch(float16_quat_norms_kernel, dim=n, inputs=[q], outputs=[lengths, normalized, length_grads], device=device)
+
+    got_lengths = lengths.numpy().astype(np.float64)
+    got_normalized = normalized.numpy().astype(np.float64)
+    for order in (1, 2):
+        np.testing.assert_allclose(got_lengths[:, order], got_lengths[:, 0], rtol=1e-3, err_msg=f"order {order} length")
+        np.testing.assert_allclose(
+            got_normalized[:, order], got_normalized[:, 0], rtol=1e-3, atol=1e-3, err_msg=f"order {order} normalize"
+        )
+    # Native float16 results, as references: the lengths and the unit quaternions.
+    np.testing.assert_allclose(got_lengths[:3, 0], [300.0, 0.0001, 50000.0], rtol=1e-3)
+    unit = q_np / np.linalg.norm(q_np, axis=1, keepdims=True)
+    np.testing.assert_allclose(got_normalized[:, 0], unit, atol=1e-3)
+    # The derivative of the length along the first component is that component of the unit quaternion.
+    grads = length_grads.numpy().astype(np.float64)
+    np.testing.assert_allclose(grads, np.stack([unit[:, 0], unit[:, 0]], axis=1), atol=1e-3)
+
+
 @wp.kernel
 def jet_origin_kernel(t: wp.array[wp.vec3d], out: wp.array[wp.float64]):
     jt, _jx = JT.seed(t[0], wp.vec3d())
@@ -425,6 +490,12 @@ add_function_test(TestJetQuat, "test_quat_ops_match_native", test_quat_ops_match
 add_function_test(TestJetQuat, "test_exp_map_chart", test_exp_map_chart, devices=devices)
 add_function_test(
     TestJetQuat, "test_normalize_and_length_follow_native", test_normalize_and_length_follow_native, devices=devices
+)
+add_function_test(
+    TestJetQuat,
+    "test_float16_lengths_and_normalize_follow_native",
+    test_float16_lengths_and_normalize_follow_native,
+    devices=devices,
 )
 add_function_test(
     TestJetQuat, "test_reverse_mode_through_quat_jets", test_reverse_mode_through_quat_jets, devices=devices
